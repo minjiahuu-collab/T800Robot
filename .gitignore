@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 walk_ctrl.txt
 walk_log.txt
+batch_results*.csv
