@@ -1,10 +1,9 @@
-"""回归测试：模型维度、贴地初始化与基座固定、PD 保持、策略接口与批量评测。"""
+"""回归测试：模型维度、贴地初始化与基座固定、PD 保持与策略接口。"""
 
 import mujoco
 import numpy as np
 import pytest
 
-from t800_sim.batch import FIELDS, rollout
 from t800_sim.config import RobotConfig
 from t800_sim.control.pd import JointPD
 from t800_sim.control.policy import RlController
@@ -79,6 +78,8 @@ def test_pd_hold_then_policy_action(model):
 
 def test_batch_rollout_metrics():
     """1 s 直行 episode：字段齐全、不跌倒、位移方向正确。"""
+    from t800_sim.batch import FIELDS, rollout
+
     row = rollout(0.6, 0.0, 0.0, duration=1.0)
 
     assert set(row) == set(FIELDS)
