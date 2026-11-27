@@ -5,11 +5,13 @@
     python3 -m t800_sim.cli teleop --box wrist  # 23: 木块挂右手腕
     python3 -m t800_sim.cli chase               # 22: 追着木块踢
     python3 -m t800_sim.cli record               # 25: 三路相机逐帧采集
+    python3 -m t800_sim.cli record --randomize   # 带域随机化的采集
     python3 -m t800_sim.cli record-grid          # 多指令/多 seed 网格采集
     python3 -m t800_sim.cli validate             # 校验采集资产完整性
     python3 -m t800_sim.cli manifest             # 数据集 manifest + train/val 划分
     python3 -m t800_sim.cli cred-check           # P1 确定性与步长收敛
     python3 -m t800_sim.cli cred-lint            # P2 物理合理性检查
+    python3 -m t800_sim.cli rand-sample          # 校验域随机化配置并预览采样
     python3 -m t800_sim.cli batch --vx 0.3 0.6  # 批量评测速度网格
 """
 
@@ -19,6 +21,15 @@ from . import scenes
 
 WRIST_BOX_SIZE = 0.10
 WRIST_BODY = "LINK_WRIST_END_R"
+
+
+def _load_rand_plan(args):
+    """按命令行开关加载随机化配置；未开启时返回 None。"""
+    if not args.randomize:
+        return None
+    from .randomization import load_plan
+
+    return load_plan(args.rand_config)
 
 
 def _wrist_box(spec) -> None:
@@ -51,6 +62,10 @@ def main(argv=None) -> None:
     )
     p_rec.add_argument("--seed", type=int, default=0, help="随机种子")
     p_rec.add_argument("--episode", type=int, default=0, help="同一 seed 下的 episode 序号")
+    p_rec.add_argument("--randomize", action="store_true",
+                       help="为每条 episode 采样并应用域随机化")
+    p_rec.add_argument("--rand-config", default=None,
+                       help="随机化配置（默认 configs/randomization.yaml）")
     p_rec.add_argument("--task", dest="task_name", default="walk",
                        help="任务名（目录分层）")
     p_rec.add_argument(
@@ -74,6 +89,10 @@ def main(argv=None) -> None:
         "--noise", type=float, nargs=3, default=[0.1, 0.05, 0.1],
         metavar=("X", "Y", "YAW"),
     )
+    p_grid.add_argument("--randomize", action="store_true",
+                        help="为每条 episode 采样并应用域随机化")
+    p_grid.add_argument("--rand-config", default=None,
+                        help="随机化配置（默认 configs/randomization.yaml）")
     p_grid.add_argument("--out", default="recordings")
 
     p_val = sub.add_parser("validate", help="校验采集 session 的完整性")
@@ -148,12 +167,31 @@ def main(argv=None) -> None:
     p_sens.add_argument("--duration", type=float, default=5.0)
     p_sens.add_argument("--out", default=None, help="CSV 输出路径（可选）")
 
+    p_rand = sub.add_parser("rand-sample", help="校验域随机化配置并预览采样")
+    p_rand.add_argument("--config", default=None,
+                        help="配置文件（默认 configs/randomization.yaml）")
+    p_rand.add_argument("--sessions", nargs="+", default=["default"],
+                        help="用于派生种子的 session 名")
+    p_rand.add_argument("--episodes", type=int, default=3,
+                        help="每个 session 采样条数（0 表示只做校验）")
+    p_rand.add_argument("--bodies", type=int, default=None,
+                        help="逐 body 参数的 body 数量（不填则按单向量预览）")
+    p_rand.add_argument("--out", default=None, help="样本 JSON 输出路径")
+
     p_batch = sub.add_parser("batch", help="批量评测：并行跑速度指令网格并输出 CSV")
     p_batch.add_argument("--vx", type=float, nargs="+", default=[0.3, 0.6, 0.9])
     p_batch.add_argument("--vy", type=float, nargs="+", default=[0.0])
     p_batch.add_argument("--yaw", type=float, nargs="+", default=[0.0])
     p_batch.add_argument("--duration", type=float, default=5.0)
     p_batch.add_argument("--workers", type=int, default=4)
+    p_batch.add_argument("--randomize", action="store_true",
+                         help="每条 trial 采样并应用域随机化")
+    p_batch.add_argument("--rand-config", default=None,
+                         help="随机化配置（默认 configs/randomization.yaml）")
+    p_batch.add_argument("--episodes", type=int, default=1,
+                         help="每条指令的随机化 trial 数（仅 --randomize 生效）")
+    p_batch.add_argument("--seed", type=int, default=0,
+                         help="batch 随机化 session 的种子")
     p_batch.add_argument("--out", default="batch_results.csv")
 
     args = parser.parse_args(argv)
@@ -177,6 +215,7 @@ def main(argv=None) -> None:
             args.duration, args.fps, args.width, args.height, args.cmd, args.out,
             scene=args.scene, seed=args.seed, episode=args.episode,
             task_name=args.task_name, init_noise=args.noise,
+            rand_plan=_load_rand_plan(args),
         )
     elif args.task == "record-grid":
         from .tasks.record import run_grid
@@ -185,6 +224,7 @@ def main(argv=None) -> None:
             args.vx, args.vy, args.yaw, args.seeds, args.episodes,
             args.duration, args.fps, args.width, args.height,
             scene=args.scene, init_noise=args.noise, out_root=args.out,
+            rand_plan=_load_rand_plan(args),
         )
     elif args.task == "validate":
         from .validate import main as run_validate
@@ -238,10 +278,23 @@ def main(argv=None) -> None:
         )
         if code:
             raise SystemExit(code)
+    elif args.task == "rand-sample":
+        from .randomization.sampler import main as run_rand_sample
+
+        code = run_rand_sample(
+            config=args.config, sessions=args.sessions,
+            episodes=args.episodes, out=args.out, bodies=args.bodies,
+        )
+        if code:
+            raise SystemExit(code)
     else:
         from .batch import run_grid
 
-        run_grid(args.vx, args.vy, args.yaw, args.duration, args.workers, args.out)
+        run_grid(
+            args.vx, args.vy, args.yaw, args.duration, args.workers, args.out,
+            rand_plan=_load_rand_plan(args),
+            episodes=args.episodes, seed=args.seed,
+        )
 
 
 if __name__ == "__main__":

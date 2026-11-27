@@ -8,6 +8,8 @@ ASSETS_DIR = SDK_DIR / "assets"
 CONFIG_ROOT = ASSETS_DIR / "config/t800"
 DEFAULT_CFG = CONFIG_ROOT / "rl_walking_example/default.yaml"
 XML_PATH = ASSETS_DIR / "resource/t800.xml"
+CONFIGS_DIR = REPO_ROOT / "configs"
+RANDOMIZATION_CFG = CONFIGS_DIR / "randomization.yaml"
 
 
 def ensure_sdk() -> None:

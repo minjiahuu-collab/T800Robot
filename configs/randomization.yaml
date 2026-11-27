@@ -1,0 +1,185 @@
+# 域随机化配置（Domain Randomization）
+# =============================================================================
+# 约定
+#   1. 单位写在参数名或 desc 里（m / ms / N·m / rad·s^-1），不靠猜。
+#   2. 参数必须显式声明分布类型，不允许"给个范围就默认均匀"。
+#   3. 未启用（enabled: false）的参数不会出现在样本里，应用层保持模型默认值。
+#   4. 作用集合（scope）必须写明，禁止把摩擦/质量一次性覆盖到所有 geom/body。
+#      可用值: global / robot_bodies / robot_geoms / ground / solver / joints
+#      per_body: true 只用于 robot_bodies 作用域的向量参数，按 body 数量独立采样。
+#   5. 样本由 (seed, session, episode) 派生，可并行、可复现，无需固定执行顺序。
+#
+# 分布类型
+#   uniform    : low..high 均匀分布，用于质量、增益等有明确上下界的量
+#   loguniform : 在 log 空间均匀，用于摩擦、阻尼等跨数量级的正值（避免采样偏向高端）
+#   normal     : 正态分布，可带 clip，用于质心偏移、传感器零偏等"围绕标称值抖动"的量
+#   choice     : 有限离散集合，用于延迟、控制周期、量化位数等工程档位
+#   fixed      : 固定值，用于显式钉住某个参数（便于对比实验）
+# =============================================================================
+version: 1
+seed: 20261126
+mode: per_episode      # per_episode: 每条 episode 重新采样
+                       # per_session : 同一 session 内固定（跨 episode 一致，便于轨迹回放）
+                       # fixed       : 全局只采样一次
+
+groups:
+  # ── 刚体惯量 ───────────────────────────────────────────────────────────────
+  dynamics:
+    desc: 质量与质心
+    enabled: true
+    params:
+      mass_scale:
+        type: uniform
+        low: 0.90
+        high: 1.10
+        scope: robot_bodies      # 只改 LINK_/Motor_ 前缀 body，world 不动
+        per_body: true            # 每个 robot body 独立采样质量系数
+        desc: 逐 body 质量缩放系数（同时按比例缩放主惯量）
+      com_offset_m:
+        type: normal
+        mean: [0.0, 0.0, 0.0]
+        std: [0.003, 0.003, 0.006]
+        scope: robot_bodies
+        per_body: true            # 每个 robot body 独立采样一个偏移
+        desc: 质心偏移 (m)，逐 body 独立采样
+
+  # ── 接触参数 ───────────────────────────────────────────────────────────────
+  # MuJoCo 摩擦是三分量（滑动/扭转/滚动），这里只随机化滑动分量 [0]，
+  # 扭转与滚动按比例跟随，避免三分量失衡把问题变成求解器压力测试。
+  contact:
+    desc: 接触摩擦与接触刚度
+    enabled: true
+    params:
+      ground_friction:
+        type: loguniform
+        low: 0.30
+        high: 1.20
+        scope: ground
+        desc: 地面滑动摩擦系数
+      robot_friction_scale:
+        type: loguniform
+        low: 0.70
+        high: 1.30
+        scope: robot_geoms
+        desc: 机器人 geom 滑动摩擦缩放
+      solref_timeconst_scale:
+        type: uniform
+        low: 0.70
+        high: 1.30
+        scope: solver
+        desc: 接触时间常数缩放（基线 o_solref[0]=0.02 s）
+
+  # ── 执行器与通信 ───────────────────────────────────────────────────────────
+  actuator:
+    desc: 控制增益、阻尼、饱和与延迟
+    enabled: true
+    params:
+      kp_scale:
+        type: uniform
+        low: 0.90
+        high: 1.10
+        desc: 关节刚度缩放
+      kd_scale:
+        type: uniform
+        low: 0.85
+        high: 1.15
+        desc: 关节阻尼增益缩放
+      joint_damping_scale:
+        type: loguniform
+        low: 0.50
+        high: 2.00
+        scope: joints
+        desc: 关节物理阻尼缩放
+      torque_limit_scale:
+        type: uniform
+        low: 0.85
+        high: 1.00
+        desc: 力矩饱和上限缩放（相对 ctrlrange）
+      motor_delay_ms:
+        type: choice
+        values: [0, 5, 10, 20]
+        desc: 指令下发到执行器的延迟
+      control_dt_ms:
+        type: choice
+        values: [15, 20, 25]
+        enabled: false           # 默认关闭：改控制周期会改变策略历史窗口的时间尺度
+        desc: 控制周期（启用时需同步调整 n_hist）
+
+  # ── 传感器 ─────────────────────────────────────────────────────────────────
+  # 区分两类噪声：
+  #   常量项（bias）：整个 episode 固定，模拟安装误差/温漂，必须可复现
+  #   随机项（random walk / 白噪声）：每步独立，用同一路 RNG 派生保证复现
+  sensors:
+    desc: IMU、编码器、力传感器与链路噪声
+    enabled: true
+    params:
+      imu_bias_gyro_rads:
+        type: normal
+        mean: [0.0, 0.0, 0.0]
+        std: [0.002, 0.002, 0.002]
+        clip: [-0.01, 0.01]
+        desc: 陀螺零偏 (rad/s)，episode 内固定
+      imu_bias_accel_mps2:
+        type: normal
+        mean: [0.0, 0.0, 0.0]
+        std: [0.02, 0.02, 0.02]
+        clip: [-0.05, 0.05]
+        desc: 加速度计零偏 (m/s^2)，episode 内固定
+      imu_random_walk_gyro:
+        type: uniform
+        low: 0.0002
+        high: 0.0010
+        desc: 陀螺随机游走步长 (rad/s per sqrt(s))
+      encoder_bits:
+        type: choice
+        values: [16, 17, 18]
+        desc: 编码器量化位数
+      force_noise_std_n:
+        type: uniform
+        low: 0.0
+        high: 2.0
+        desc: 足端力传感器白噪声标准差 (N)
+      frame_dropout_prob:
+        type: choice
+        values: [0.0, 0.01, 0.05]
+        desc: 观测帧丢弃概率
+      latency_ms:
+        type: choice
+        values: [0, 10, 20]
+        desc: 观测链路延迟
+
+  # ── 相机内外参 ─────────────────────────────────────────────────────────────
+  # 启用后 fovy/位置扰动写进模型：渲染图像与 projections.csv 的 2D 投影标签
+  # 都使用扰动后的相机参数，保证图像与标签对齐；cameras.csv 记录真实世界位姿。
+  camera:
+    desc: 相机内参与安装位姿
+    enabled: true
+    params:
+      fovy_scale:
+        type: uniform
+        low: 0.95
+        high: 1.05
+        desc: 垂直视场角缩放
+      pos_noise_m:
+        type: normal
+        mean: [0.0, 0.0, 0.0]
+        std: [0.002, 0.002, 0.002]
+        desc: 相机安装位置扰动 (m)
+
+  # ── 光照与纹理 ─────────────────────────────────────────────────────────────
+  # light_intensity_scale 缩放 diffuse/specular；texture_swap_prob 在同尺寸
+  # 材质间置换 RGB 贴图（逐 episode 由派生 RNG 决定是否置换）。
+  rendering:
+    desc: 光照强度与材质
+    enabled: true
+    params:
+      light_intensity_scale:
+        type: uniform
+        low: 0.70
+        high: 1.30
+        desc: 光照强度缩放
+      texture_swap_prob:
+        type: uniform
+        low: 0.0
+        high: 0.5
+        desc: 每个 episode 替换材质的概率

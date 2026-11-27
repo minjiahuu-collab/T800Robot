@@ -97,6 +97,13 @@ def validate_session(path) -> dict:
         missing = [c for c in REQUIRED_STATES if c not in fields]
         if missing:
             errors.append(f"states.csv 缺少列: {', '.join(missing)}")
+        for name in meta.get("force_sensors") or []:
+            force_missing = [
+                f"{name}_{axis}" for axis in ("x", "y", "z")
+                if f"{name}_{axis}" not in fields
+            ]
+            if force_missing:
+                errors.append(f"states.csv 缺少力传感器列: {', '.join(force_missing)}")
         if n is not None:
             if len(rows) != n:
                 errors.append(f"states.csv 行数 {len(rows)} != frames {n}")
@@ -132,6 +139,26 @@ def validate_session(path) -> dict:
                 errors.append(
                     f"cameras.csv 行数 {len(cam_rows)} != frames×cameras {expect}"
                 )
+
+        # 新 session 声明了 meta.projection，就必须有对齐的 projections.csv。
+        proj_meta = meta.get("projection")
+        if proj_meta:
+            proj_path = path / "projections.csv"
+            if not proj_path.is_file():
+                errors.append("缺少 projections.csv")
+            else:
+                proj_rows, proj_fields = _read_csv(proj_path)
+                for col in ("frame", "cam", "target", "u", "v", "depth", "in_view"):
+                    if col not in proj_fields:
+                        errors.append(f"projections.csv 缺少列: {col}")
+                        break
+                targets = proj_meta.get("targets") or []
+                expect_p = n * ncam * len(targets)
+                if len(proj_rows) != expect_p:
+                    errors.append(
+                        f"projections.csv 行数 {len(proj_rows)} "
+                        f"!= frames×cameras×targets {expect_p}"
+                    )
 
     width = meta.get("width")
     height = meta.get("height")

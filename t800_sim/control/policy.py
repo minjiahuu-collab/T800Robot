@@ -6,6 +6,7 @@
 """
 
 import time
+from collections import deque
 from pathlib import Path
 
 import MNN
@@ -40,7 +41,8 @@ class MNNPolicy:
 class RlController:
     """观测 -> 策略 -> 目标关节角 -> PD 力矩，一个控制周期调一次 act()。"""
 
-    def __init__(self, cfg, robot, policy_path: Path):
+    def __init__(self, cfg, robot, policy_path: Path, *, kp=None, kd=None,
+                 motor_delay_steps: int = 0, sensor=None):
         self.cfg = cfg
         self.robot = robot
         self.policy = MNNPolicy(policy_path)
@@ -48,7 +50,15 @@ class RlController:
         self.default_q_act = cfg.default_q[self.slots]
         self.history = np.zeros((cfg.n_hist, cfg.num_obs))
         self.action = np.zeros(len(self.slots))
-        self.pd = JointPD(cfg.kp, cfg.kd, robot.ctrl_lo, robot.ctrl_hi)
+        self.pd = JointPD(
+            cfg.kp if kp is None else np.asarray(kp, dtype=float),
+            cfg.kd if kd is None else np.asarray(kd, dtype=float),
+            robot.ctrl_lo, robot.ctrl_hi,
+        )
+        # 域随机化的运行时钩子；保持默认值时不改变原有行为。
+        self.sensor = sensor
+        self._motor_delay_steps = max(0, int(motor_delay_steps))
+        self._delay = deque()
 
     @property
     def last_ms(self) -> float:
@@ -62,6 +72,9 @@ class RlController:
         ang_vel = robot.data.qvel[3:6]  # 自由关节角速度在机体坐标系
         proj_grav = robot.rotation().T @ np.array([0.0, 0.0, -1.0])
 
+        if self.sensor is not None:
+            q, qd, ang_vel, proj_grav = self.sensor.observe(q, qd, ang_vel, proj_grav)
+
         obs = np.concatenate([q - self.default_q_act, qd, self.action, ang_vel, proj_grav])
         obs = np.clip(obs * cfg.obs_scale, -cfg.obs_clip, cfg.obs_clip)
 
@@ -73,4 +86,12 @@ class RlController:
 
         q_des = cfg.default_q.copy()
         q_des[self.slots] += self.action * cfg.action_scale
-        return self.pd.torque(q_des, robot.qpos(), robot.qvel())
+        tau = self.pd.torque(q_des, robot.qpos(), robot.qvel())
+
+        if not self._motor_delay_steps:
+            return tau
+        # 指令延迟：缓冲区没填满时重复当前指令，避免起始阶段丢力矩。
+        self._delay.append(tau)
+        if len(self._delay) > self._motor_delay_steps:
+            return self._delay.popleft()
+        return tau

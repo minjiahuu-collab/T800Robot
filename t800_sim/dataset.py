@@ -25,6 +25,11 @@ from .validate import find_sessions, validate_session
 
 FIELDS = (
     "session", "task", "scene", "seed", "episode",
+    "randomized", "plan_hash", "rand_session",
+    "mass_scale", "ground_friction", "robot_friction_scale",
+    "solref_timeconst_scale", "joint_damping_scale", "torque_limit_scale",
+    "kp_scale", "kd_scale",
+    "fovy_scale", "light_intensity_scale", "texture_swap_prob",
     "cmd_vx", "cmd_vy", "cmd_yaw",
     "frames", "duration", "mean_vx", "final_dx", "fell", "success",
     "cameras", "schema_version", "policy_sha256", "git_commit",
@@ -43,12 +48,42 @@ def _row(root: Path, session: Path) -> dict:
     cmd = meta.get("cmd") or [None, None, None]
     report = validate_session(session)
     policy = meta.get("policy") or {}
+    rand = meta.get("randomization") or {}
+    rand_on = bool(rand.get("enabled"))
+    rparams = rand.get("params") or {}
+    rdyn = rparams.get("dynamics") or {}
+    rcon = rparams.get("contact") or {}
+    ract = rparams.get("actuator") or {}
+    rcam = rparams.get("camera") or {}
+    rren = rparams.get("rendering") or {}
+    rplan = rand.get("plan") or {}
+    # 逐 body 质量缩放是向量；manifest 单列用均值代表。
+    mass_scale = rdyn.get("mass_scale", "")
+    if isinstance(mass_scale, (list, tuple)):
+        mass_scale = (
+            round(sum(float(v) for v in mass_scale) / len(mass_scale), 6)
+            if mass_scale else ""
+        )
     return {
         "session": str(session.relative_to(root)),
         "task": meta.get("task", ""),
         "scene": meta.get("scene_id", ""),
         "seed": meta.get("seed", -1),
         "episode": meta.get("episode", 0),
+        "randomized": rand_on,
+        "plan_hash": rplan.get("plan_hash", "") if rand_on else "",
+        "rand_session": rplan.get("session", "") if rand_on else "",
+        "mass_scale": mass_scale,
+        "ground_friction": rcon.get("ground_friction", ""),
+        "robot_friction_scale": rcon.get("robot_friction_scale", ""),
+        "solref_timeconst_scale": rcon.get("solref_timeconst_scale", ""),
+        "joint_damping_scale": ract.get("joint_damping_scale", ""),
+        "torque_limit_scale": ract.get("torque_limit_scale", ""),
+        "kp_scale": ract.get("kp_scale", ""),
+        "kd_scale": ract.get("kd_scale", ""),
+        "fovy_scale": rcam.get("fovy_scale", ""),
+        "light_intensity_scale": rren.get("light_intensity_scale", ""),
+        "texture_swap_prob": rren.get("texture_swap_prob", ""),
         "cmd_vx": cmd[0],
         "cmd_vy": cmd[1],
         "cmd_yaw": cmd[2],
@@ -129,11 +164,13 @@ def build_manifest(root="recordings", *, val_ratio: float = 0.3,
     val = [r for r in rows if r["split"] == "val"]
     by_task = Counter((r["task"], r["split"]) for r in valid_rows)
     policies = {r["policy_sha256"] for r in rows if r["policy_sha256"]}
+    randomized = [r for r in rows if r["randomized"]]
     summary = {
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "root": str(root),
         "schema_version": "1.0",
         "sessions": len(rows),
+        "randomized_sessions": len(randomized),
         "valid_sessions": len(valid_rows),
         "train_sessions": len(train),
         "val_sessions": len(val),
@@ -161,6 +198,12 @@ def build_manifest(root="recordings", *, val_ratio: float = 0.3,
     print(f"session: {len(rows)} 条（有效 {len(valid_rows)}），"
           f"{summary['frames']} 帧，{summary['size_mb']} MB，"
           f"success={summary['success_rate'] * 100:.1f}%")
+    if randomized:
+        masses = [float(r["mass_scale"]) for r in randomized if r["mass_scale"] != ""]
+        mass_txt = f"{min(masses):.3f}~{max(masses):.3f}" if masses else "-"
+        print(f"随机化: {len(randomized)}/{len(rows)} 条，mass_scale {mass_txt}")
+    if 0 < len(randomized) < len(rows):
+        print("警告: manifest 混有随机化与非随机化 session，训练前请确认是否需要隔离")
     if len(policies) > 1:
         print(f"警告: manifest 内包含 {len(policies)} 个不同策略版本")
     print(f"划分: by={split_by}, val_ratio={val_ratio}, seed={seed} -> "

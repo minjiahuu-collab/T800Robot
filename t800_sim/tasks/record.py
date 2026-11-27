@@ -12,6 +12,7 @@
     python3 -m t800_sim.cli record
     python3 -m t800_sim.cli record --duration 10 --fps 30 --width 640 --height 480
     python3 -m t800_sim.cli record --cmd 0 0 0.4 --scene empty --seed 3
+    python3 -m t800_sim.cli record --randomize --seed 3   # 域随机化采集
     python3 -m t800_sim.cli record-grid --vx 0.3 0.6 --seeds 0 1 2
 """
 
@@ -27,12 +28,14 @@ from ..capture import (
     CAMERA_NAMES,
     MultiCamRecorder,
     add_cameras,
+    available_force_sensors,
     sha256_file,
 )
 from ..config import RobotConfig
 from ..control.policy import RlController
 from ..model import build_model
 from ..paths import CONFIG_ROOT
+from ..randomization import SensorModel, apply_sample, body_shapes, sample
 from ..robot import Robot
 from ..scenes import add_box
 
@@ -95,6 +98,7 @@ def run(
     episode: int = 0,
     task_name: str = "walk",
     init_noise=DEFAULT_NOISE,
+    rand_plan=None,
 ) -> Path:
     """采集一条 episode，返回 session 目录。"""
     cfg = RobotConfig.load()
@@ -103,9 +107,54 @@ def run(
     if scene_hook is not None:
         hooks.append(scene_hook)
     model = build_model(hooks)
+
+    rand_sample = None
+    applied = None
+    rand_session = None
+    dt_ctrl = cfg.dt_ctrl
+    if rand_plan is not None:
+        # 同一 task/scene/seed 归为一个 session：per_session 模式可固定物理参数，
+        # per_episode 模式仍然每条 episode 重新采样。
+        rand_session = f"{task_name}/{scene}/seed_{int(seed):04d}"
+        rand_sample = sample(
+            rand_plan, rand_session, episode,
+            shapes=body_shapes(model, rand_plan),
+        )
+        apply_rng = np.random.default_rng([int(seed), int(episode), 0x0C0A])
+        applied = apply_sample(
+            model, rand_sample, dt_ctrl=cfg.dt_ctrl, rng=apply_rng
+        )
+        dt_ctrl = applied.runtime.control_dt or cfg.dt_ctrl
+        if applied.runtime.control_dt is not None:
+            print(f"随机化控制周期: {dt_ctrl * 1000:.1f} ms"
+                  f"（配置默认 {cfg.dt_ctrl * 1000:.1f} ms）")
+
     data = mujoco.MjData(model)
-    robot = Robot(model, data)
-    ctrl = RlController(cfg, robot, CONFIG_ROOT / cfg.policy_file)
+    robot = Robot(model, data)  # ctrlrange 已在 apply_sample 中缩放
+
+    kp, kd = (
+        applied.runtime.scaled_gains(cfg.kp, cfg.kd)
+        if applied is not None else (cfg.kp, cfg.kd)
+    )
+    sensor = (
+        SensorModel(
+            applied.runtime.sensor,
+            dt=dt_ctrl,
+            rng=np.random.default_rng([int(seed), int(episode), 0x5E05]),
+        )
+        if applied is not None else None
+    )
+    ctrl = RlController(
+        cfg, robot, CONFIG_ROOT / cfg.policy_file,
+        kp=kp, kd=kd, sensor=sensor,
+        motor_delay_steps=applied.runtime.motor_delay_steps if applied is not None else 0,
+    )
+
+    # 力噪声用独立 RNG：采集频率与策略频率不同，不能和观测噪声共用随机流。
+    force_rng = np.random.default_rng([int(seed), int(episode), 0xF0])
+
+    def force_noise(_name, values):
+        return sensor.force(values, rng=force_rng) if sensor is not None else values
 
     robot.set_joint_pose(cfg.default_q)
     robot.forward()
@@ -125,6 +174,15 @@ def run(
         if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, name) < 0:
             raise RuntimeError(f"相机注入失败: {name}")
 
+    cam_dropout = 0.0
+    cam_latency_ms = 0.0
+    cam_rng = None
+    if applied is not None:
+        cam_dropout = applied.runtime.sensor.dropout_prob
+        cam_latency_ms = applied.runtime.sensor.latency_ms
+        # 独立于本体观测（0x5E05）与力噪声（0xF0）的相机链路随机流。
+        cam_rng = np.random.default_rng([int(seed), int(episode), 0xC472])
+
     session = _session_dir(Path(out_root), task_name, scene, seed, episode)
     cmd = np.asarray(cmd, dtype=float)
     policy_path = CONFIG_ROOT / cfg.policy_file
@@ -138,24 +196,43 @@ def run(
         seed=seed,
         policy={"file": cfg.policy_file, "sha256": sha256_file(policy_path)},
         gt_object=gt_object,
+        force_sensors=available_force_sensors(model),
+        force_noise=force_noise,
         success_vx_ratio=SUCCESS_VX_RATIO,
+        camera_dropout_prob=cam_dropout,
+        camera_latency_ms=cam_latency_ms,
+        camera_rng=cam_rng,
         extra_meta={
             "cmd": [float(c) for c in cmd],
             "episode": int(episode),
             "init_noise": [float(v) for v in init_noise],
+            "control_dt": float(dt_ctrl),
+            "randomization": (
+                {
+                    "enabled": True,
+                    "plan": rand_sample["meta"],
+                    "params": rand_sample["params"],
+                    "applied": applied.as_dict(),
+                }
+                if applied is not None else {"enabled": False}
+            ),
         },
     )
     rec.set_command(cmd)
 
-    n_sub = max(1, round(cfg.dt_ctrl / model.opt.timestep))
-    n_steps = max(1, round(duration / cfg.dt_ctrl))
+    n_sub = max(1, round(dt_ctrl / model.opt.timestep))
+    n_steps = max(1, round(duration / dt_ctrl))
     throttle = loop.LogThrottle(LOG_DT)
 
     print(f"场景: {scene}（真值物体: {gt_object or '无'}）, seed={seed} ep={episode}")
-    print(f"相机: {', '.join(CAMERA_NAMES)} (fovy 70, 挂在头部/左右手腕)")
+    print(f"相机: {', '.join(CAMERA_NAMES)} (挂在头部/左右手腕，fovy 见 meta)")
     print(f"采集: {duration:.1f} s @ {fps:.0f} fps, {width}x{height}, "
           f"指令 cmd=({cmd[0]:+.2f},{cmd[1]:+.2f},{cmd[2]:+.2f})")
     print(f"输出: {session}")
+    if applied is not None:
+        print(f"随机化: hash={rand_sample['meta']['plan_hash']} "
+              f"session={rand_session} ep={episode} "
+              f"指令延迟={applied.runtime.motor_delay_steps} 步")
 
     t0 = time.time()
     try:
@@ -196,6 +273,7 @@ def run_grid(
     scene: str = "box",
     init_noise=(0.1, 0.05, 0.1),
     out_root="recordings",
+    rand_plan=None,
 ):
     """速度指令 × seed × episode 的网格采集，按 cmd 分 task 目录。"""
     sessions = []
@@ -210,6 +288,7 @@ def run_grid(
                     duration, fps, width, height, (vx, vy, yaw), out_root,
                     scene=scene, seed=int(seed), episode=ep,
                     task_name=task_name, init_noise=init_noise,
+                    rand_plan=rand_plan,
                 ))
     print(f"\n网格采集完成: {len(sessions)} 条 session -> {out_root}")
     return sessions

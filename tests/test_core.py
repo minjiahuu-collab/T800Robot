@@ -86,3 +86,19 @@ def test_batch_rollout_metrics():
     assert row["fell"] is False
     assert row["h_min"] > 0.9
     assert row["dx"] > 0.1
+    assert row["randomized"] is False
+    assert row["mass_scale"] == ""
+
+
+def test_batch_rollout_with_randomization():
+    """batch 的随机化 trial 应带上采样参数，且能正常跑完。"""
+    from t800_sim.batch import rollout
+    from t800_sim.randomization import load_plan
+
+    row = rollout(
+        0.6, 0.0, 0.0, duration=0.5,
+        rand_plan=load_plan(), rand_session="test", episode=0,
+    )
+
+    assert row["randomized"] is True
+    assert 0.9 <= float(row["mass_scale"]) <= 1.1
